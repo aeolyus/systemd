@@ -3,7 +3,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/btrfs.h>
+#if WANT_LINUX_FS_H
 #include <linux/fs.h>
+#endif
 #include <linux/magic.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
@@ -652,7 +654,7 @@ int rearrange_stdio(int original_input_fd, int original_output_fd, int original_
                                 goto finish;
                         }
 
-                        CLOSE_AND_REPLACE(null_fd, copy);
+                        close_and_replace(null_fd, copy);
                 }
         }
 

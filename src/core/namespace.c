@@ -7,7 +7,9 @@
 #include <sys/file.h>
 #include <sys/mount.h>
 #include <unistd.h>
+#if WANT_LINUX_FS_H
 #include <linux/fs.h>
+#endif
 
 #include "alloc-util.h"
 #include "base-filesystem.h"
@@ -924,7 +926,7 @@ static int mount_private_dev(MountEntry *m) {
 
         dev = strjoina(temporary_mount, "/dev");
         (void) mkdir(dev, 0755);
-        r = mount_nofollow_verbose(LOG_DEBUG, "tmpfs", dev, "tmpfs", DEV_MOUNT_OPTIONS, "mode=755" TMPFS_LIMITS_DEV);
+        r = mount_nofollow_verbose(LOG_DEBUG, "tmpfs", dev, "tmpfs", DEV_MOUNT_OPTIONS, "mode=755" TMPFS_LIMITS_PRIVATE_DEV);
         if (r < 0)
                 goto fail;
 
@@ -2001,7 +2003,6 @@ int setup_namespace(
                 char **error_path) {
 
         _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
-        _cleanup_(decrypted_image_unrefp) DecryptedImage *decrypted_image = NULL;
         _cleanup_(dissected_image_unrefp) DissectedImage *dissected_image = NULL;
         _cleanup_(verity_settings_done) VeritySettings verity = VERITY_SETTINGS_DEFAULT;
         _cleanup_strv_free_ char **hierarchies = NULL;
@@ -2056,23 +2057,15 @@ int setup_namespace(
                                 root_image,
                                 FLAGS_SET(dissect_image_flags, DISSECT_IMAGE_DEVICE_READ_ONLY) ? O_RDONLY : -1 /* < 0 means writable if possible, read-only as fallback */,
                                 FLAGS_SET(dissect_image_flags, DISSECT_IMAGE_NO_PARTITION_TABLE) ? 0 : LO_FLAGS_PARTSCAN,
+                                LOCK_SH,
                                 &loop_device);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to create loop device for root image: %m");
 
-                /* Make sure udevd won't issue BLKRRPART (which might flush out the loaded partition table)
-                 * while we are still trying to mount things */
-                r = loop_device_flock(loop_device, LOCK_SH);
-                if (r < 0)
-                        return log_debug_errno(r, "Failed to lock loopback device with LOCK_SH: %m");
-
-                r = dissect_image(
-                                loop_device->fd,
+                r = dissect_loop_device(
+                                loop_device,
                                 &verity,
                                 root_image_options,
-                                loop_device->diskseq,
-                                loop_device->uevent_seqnum_not_before,
-                                loop_device->timestamp_not_before,
                                 dissect_image_flags,
                                 &dissected_image);
                 if (r < 0)
@@ -2089,8 +2082,7 @@ int setup_namespace(
                                 dissected_image,
                                 NULL,
                                 &verity,
-                                dissect_image_flags,
-                                &decrypted_image);
+                                dissect_image_flags);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to decrypt dissected image: %m");
         }
@@ -2422,16 +2414,11 @@ int setup_namespace(
                         goto finish;
                 }
 
-                if (decrypted_image) {
-                        r = decrypted_image_relinquish(decrypted_image);
-                        if (r < 0) {
-                                log_debug_errno(r, "Failed to relinquish decrypted image: %m");
-                                goto finish;
-                        }
+                r = dissected_image_relinquish(dissected_image);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to relinquish dissected image: %m");
+                        goto finish;
                 }
-
-                dissected_image_relinquish(dissected_image);
-                loop_device_relinquish(loop_device);
 
         } else if (root_directory) {
 

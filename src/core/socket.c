@@ -1421,6 +1421,7 @@ static int socket_determine_selinux_label(Socket *s, char **ret) {
 
                 Unit *service;
                 ExecCommand *c;
+                const char *exec_context;
                 _cleanup_free_ char *path = NULL;
 
                 r = socket_load_service_unit(s, -1, &service);
@@ -1428,6 +1429,18 @@ static int socket_determine_selinux_label(Socket *s, char **ret) {
                         goto no_label;
                 if (r < 0)
                         return r;
+
+                exec_context = SERVICE(service)->exec_context.selinux_context;
+                if (exec_context) {
+                        char *con;
+
+                        con = strdup(exec_context);
+                        if (!con)
+                                return -ENOMEM;
+
+                        *ret = TAKE_PTR(con);
+                        return 0;
+                }
 
                 c = SERVICE(service)->exec_command[SERVICE_EXEC_START];
                 if (!c)
@@ -2978,10 +2991,9 @@ shortcut:
 }
 
 static int socket_dispatch_io(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
-        SocketPort *p = userdata;
+        SocketPort *p = ASSERT_PTR(userdata);
         int cfd = -1;
 
-        assert(p);
         assert(fd >= 0);
 
         if (p->socket->state != SOCKET_LISTENING)

@@ -5,11 +5,27 @@
 
 #include "netif-util.h"
 #include "networkd-address.h"
+#include "networkd-ipv4acd.h"
 #include "networkd-ipv4ll.h"
 #include "networkd-link.h"
 #include "networkd-manager.h"
 #include "networkd-queue.h"
 #include "parse-util.h"
+
+bool link_ipv4ll_enabled(Link *link) {
+        assert(link);
+
+        if (!link_ipv4acd_supported(link))
+                return false;
+
+        if (!link->network)
+                return false;
+
+        if (link->network->bond)
+                return false;
+
+        return link->network->link_local & ADDRESS_FAMILY_IPV4;
+}
 
 static int address_new_from_ipv4ll(Link *link, Address **ret) {
         _cleanup_(address_freep) Address *address = NULL;
@@ -108,10 +124,9 @@ static int ipv4ll_address_claimed(sd_ipv4ll *ll, Link *link) {
 }
 
 static void ipv4ll_handler(sd_ipv4ll *ll, int event, void *userdata) {
-        Link *link = userdata;
+        Link *link = ASSERT_PTR(userdata);
         int r;
 
-        assert(link);
         assert(link->network);
 
         if (IN_SET(link->state, LINK_STATE_FAILED, LINK_STATE_LINGER))
@@ -153,10 +168,9 @@ static void ipv4ll_handler(sd_ipv4ll *ll, int event, void *userdata) {
 }
 
 static int ipv4ll_check_mac(sd_ipv4ll *ll, const struct ether_addr *mac, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         struct hw_addr_data hw_addr;
 
-        assert(m);
         assert(mac);
 
         hw_addr = (struct hw_addr_data) {
@@ -187,8 +201,8 @@ int ipv4ll_configure(Link *link) {
         if (r < 0)
                 return r;
 
-        if (link->sd_device &&
-            net_get_unique_predictable_data(link->sd_device, true, &seed) >= 0) {
+        if (link->dev &&
+            net_get_unique_predictable_data(link->dev, true, &seed) >= 0) {
                 r = sd_ipv4ll_set_address_seed(link->ipv4ll, seed);
                 if (r < 0)
                         return r;
@@ -234,13 +248,12 @@ int config_parse_ipv4ll(
                 void *data,
                 void *userdata) {
 
-        AddressFamily *link_local = data;
+        AddressFamily *link_local = ASSERT_PTR(data);
         int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         /* Note that this is mostly like
          * config_parse_address_family(), except that it

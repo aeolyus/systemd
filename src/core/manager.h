@@ -356,6 +356,7 @@ struct Manager {
         ExecOutput default_std_output, default_std_error;
 
         usec_t default_restart_usec, default_timeout_start_usec, default_timeout_stop_usec;
+        usec_t default_device_timeout_usec;
         usec_t default_timeout_abort_usec;
         bool default_timeout_abort_set;
 
@@ -406,6 +407,9 @@ struct Manager {
         char *switch_root;
         char *switch_root_init;
 
+        /* This is true before and after switching root. */
+        bool switching_root;
+
         /* This maps all possible path prefixes to the units needing
          * them. It's a hashmap with a path string as key and a Set as
          * value where Unit objects are contained. */
@@ -446,8 +450,6 @@ struct Manager {
         unsigned sigchldgen;
         unsigned notifygen;
 
-        bool honor_device_enumeration;
-
         VarlinkServer *varlink_server;
         /* When we're a system manager, this object manages the subscription from systemd-oomd to PID1 that's
          * used to report changes in ManagedOOM settings (systemd server - oomd client). When
@@ -475,6 +477,8 @@ static inline usec_t manager_default_timeout_abort_usec(Manager *m) {
 
 /* The objective is set to OK as soon as we enter the main loop, and set otherwise as soon as we are done with it */
 #define MANAGER_IS_RUNNING(m) ((m)->objective == MANAGER_OK)
+
+#define MANAGER_IS_SWITCHING_ROOT(m) ((m)->switching_root)
 
 #define MANAGER_IS_TEST_RUN(m) ((m)->test_run_flags != 0)
 
@@ -541,6 +545,7 @@ void manager_set_show_status(Manager *m, ShowStatus mode, const char *reason);
 void manager_override_show_status(Manager *m, ShowStatus mode, const char *reason);
 
 void manager_set_first_boot(Manager *m, bool b);
+void manager_set_switching_root(Manager *m, bool switching_root);
 
 void manager_status_printf(Manager *m, StatusType type, const char *status, const char *format, ...) _printf_(4,5);
 

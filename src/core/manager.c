@@ -308,9 +308,7 @@ static int have_ask_password(void) {
 
 static int manager_dispatch_ask_password_fd(sd_event_source *source,
                                             int fd, uint32_t revents, void *userdata) {
-        Manager *m = userdata;
-
-        assert(m);
+        Manager *m = ASSERT_PTR(userdata);
 
         (void) flush_fd(fd);
 
@@ -807,6 +805,10 @@ static int manager_find_credentials_dirs(Manager *m) {
         return 0;
 }
 
+void manager_set_switching_root(Manager *m, bool switching_root) {
+        m->switching_root = MANAGER_IS_SYSTEM(m) && switching_root;
+}
+
 int manager_new(LookupScope scope, ManagerTestRunFlags test_run_flags, Manager **_m) {
         _cleanup_(manager_freep) Manager *m = NULL;
         int r;
@@ -831,6 +833,7 @@ int manager_new(LookupScope scope, ManagerTestRunFlags test_run_flags, Manager *
                 .default_timeout_start_usec = DEFAULT_TIMEOUT_USEC,
                 .default_timeout_stop_usec = DEFAULT_TIMEOUT_USEC,
                 .default_restart_usec = DEFAULT_RESTART_USEC,
+                .default_device_timeout_usec = DEFAULT_TIMEOUT_USEC,
 
                 .original_log_level = -1,
                 .original_log_target = _LOG_TARGET_INVALID,
@@ -1760,8 +1763,6 @@ static void manager_ready(Manager *m) {
                 (void) touch_file("/run/systemd/systemd-units-load", false,
                         m->timestamps[MANAGER_TIMESTAMP_UNITS_LOAD].realtime ?: now(CLOCK_REALTIME),
                         UID_INVALID, GID_INVALID, 0444);
-
-        m->honor_device_enumeration = true;
 }
 
 Manager* manager_reloading_start(Manager *m) {
@@ -1871,6 +1872,8 @@ int manager_startup(Manager *m, FILE *serialization, FDSet *fds, const char *roo
         }
 
         manager_ready(m);
+
+        manager_set_switching_root(m, false);
 
         return 0;
 }
@@ -2260,11 +2263,10 @@ void manager_unwatch_pid(Manager *m, pid_t pid) {
 }
 
 static int manager_dispatch_run_queue(sd_event_source *source, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         Job *j;
 
         assert(source);
-        assert(m);
 
         while ((j = prioq_peek(m->run_queue))) {
                 assert(j->installed);
@@ -2445,7 +2447,7 @@ static void manager_invoke_notify_message(
 static int manager_dispatch_notify_fd(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
 
         _cleanup_fdset_free_ FDSet *fds = NULL;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         char buf[NOTIFY_BUFFER_MAX+1];
         struct iovec iovec = {
                 .iov_base = buf,
@@ -2470,7 +2472,6 @@ static int manager_dispatch_notify_fd(sd_event_source *source, int fd, uint32_t 
         bool found = false;
         ssize_t n;
 
-        assert(m);
         assert(m->notify_fd == fd);
 
         if (revents != EPOLLIN) {
@@ -2613,12 +2614,11 @@ static void manager_invoke_sigchld_event(
 }
 
 static int manager_dispatch_sigchld(sd_event_source *source, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         siginfo_t si = {};
         int r;
 
         assert(source);
-        assert(m);
 
         /* First we call waitid() for a PID and do not reap the zombie. That way we can still access
          * /proc/$PID for it while it is a zombie. */
@@ -2735,12 +2735,11 @@ static void manager_handle_ctrl_alt_del(Manager *m) {
 }
 
 static int manager_dispatch_signal_fd(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         ssize_t n;
         struct signalfd_siginfo sfsi;
         int r;
 
-        assert(m);
         assert(m->signal_fd == fd);
 
         if (revents != EPOLLIN) {
@@ -2758,7 +2757,7 @@ static int manager_dispatch_signal_fd(sd_event_source *source, int fd, uint32_t 
                 return log_error_errno(errno, "Reading from signal fd failed: %m");
         }
         if (n != sizeof(sfsi)) {
-                log_warning("Truncated read from signal fd (%zu bytes), ignoring!", n);
+                log_warning("Truncated read from signal fd (%zi bytes), ignoring!", n);
                 return 0;
         }
 
@@ -2931,10 +2930,8 @@ static int manager_dispatch_signal_fd(sd_event_source *source, int fd, uint32_t 
 }
 
 static int manager_dispatch_time_change_fd(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         Unit *u;
-
-        assert(m);
 
         log_struct(LOG_DEBUG,
                    "MESSAGE_ID=" SD_MESSAGE_TIME_CHANGE_STR,
@@ -2955,11 +2952,9 @@ static int manager_dispatch_timezone_change(
                 const struct inotify_event *e,
                 void *userdata) {
 
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         int changed;
         Unit *u;
-
-        assert(m);
 
         log_debug("inotify event for /etc/localtime");
 
@@ -2983,9 +2978,8 @@ static int manager_dispatch_timezone_change(
 }
 
 static int manager_dispatch_idle_pipe_fd(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
 
-        assert(m);
         assert(m->idle_pipe[2] == fd);
 
         /* There's at least one Type=idle child that just gave up on us waiting for the boot process to
@@ -3003,10 +2997,9 @@ static int manager_dispatch_idle_pipe_fd(sd_event_source *source, int fd, uint32
 }
 
 static int manager_dispatch_jobs_in_progress(sd_event_source *source, usec_t usec, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         int r;
 
-        assert(m);
         assert(source);
 
         manager_print_jobs_in_progress(m);
@@ -3417,11 +3410,6 @@ int manager_reload(Manager *m) {
         /* Consider the reload process complete now. */
         assert(m->n_reloading > 0);
         m->n_reloading--;
-
-        /* On manager reloading, device tag data should exists, thus, we should honor the results of device
-         * enumeration. The flag should be always set correctly by the serialized data, but it may fail. So,
-         * let's always set the flag here for safety. */
-        m->honor_device_enumeration = true;
 
         manager_ready(m);
 
@@ -4469,8 +4457,7 @@ int manager_dispatch_user_lookup_fd(sd_event_source *source, int fd, uint32_t re
 }
 
 static int short_uid_range(const char *path) {
-        _cleanup_free_ UidRange *p = NULL;
-        size_t n = 0;
+        _cleanup_(uid_range_freep) UidRange *p = NULL;
         int r;
 
         assert(path);
@@ -4478,13 +4465,14 @@ static int short_uid_range(const char *path) {
         /* Taint systemd if we the UID range assigned to this environment doesn't at least cover 0…65534,
          * i.e. from root to nobody. */
 
-        r = uid_range_load_userns(&p, &n, path);
-        if (ERRNO_IS_NOT_SUPPORTED(r))
-                return false;
-        if (r < 0)
+        r = uid_range_load_userns(&p, path);
+        if (r < 0) {
+                if (ERRNO_IS_NOT_SUPPORTED(r))
+                        return false;
                 return log_debug_errno(r, "Failed to load %s: %m", path);
+        }
 
-        return !uid_range_covers(p, n, 0, 65535);
+        return !uid_range_covers(p, 0, 65535);
 }
 
 char* manager_taint_string(const Manager *m) {

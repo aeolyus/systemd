@@ -24,6 +24,7 @@
 
 #include "alloc-util.h"
 #include "chase-symlinks.h"
+#include "device-private.h"
 #include "device-util.h"
 #include "dirent-util.h"
 #include "fd-util.h"
@@ -53,6 +54,7 @@ typedef enum NetNameType {
         NET_XENVIF,
         NET_PLATFORM,
         NET_NETDEVSIM,
+        NET_DEVICETREE,
 } NetNameType;
 
 typedef struct NetNames {
@@ -71,6 +73,7 @@ typedef struct NetNames {
         char xen_slot[ALTIFNAMSIZ];
         char platform_path[ALTIFNAMSIZ];
         char netdevsim_path[ALTIFNAMSIZ];
+        char devicetree_onboard[ALTIFNAMSIZ];
 } NetNames;
 
 /* skip intermediate virtio devices */
@@ -96,7 +99,7 @@ static sd_device *skip_virtio(sd_device *dev) {
 
 static int get_virtfn_info(sd_device *pcidev, sd_device **ret_physfn_pcidev, char **ret_suffix) {
         _cleanup_(sd_device_unrefp) sd_device *physfn_pcidev = NULL;
-        const char *physfn_syspath, *syspath;
+        const char *syspath;
         _cleanup_closedir_ DIR *dir = NULL;
         int r;
 
@@ -109,36 +112,30 @@ static int get_virtfn_info(sd_device *pcidev, sd_device **ret_physfn_pcidev, cha
                 return r;
 
         /* Get physical function's pci device. */
-        physfn_syspath = strjoina(syspath, "/physfn");
-        r = sd_device_new_from_syspath(&physfn_pcidev, physfn_syspath);
-        if (r < 0)
-                return r;
-
-        r = sd_device_get_syspath(physfn_pcidev, &physfn_syspath);
+        r = sd_device_new_child(&physfn_pcidev, pcidev, "physfn");
         if (r < 0)
                 return r;
 
         /* Find the virtual function number by finding the right virtfn link. */
-        dir = opendir(physfn_syspath);
-        if (!dir)
-                return -errno;
+        r = device_opendir(physfn_pcidev, NULL, &dir);
+        if (r < 0)
+                return r;
 
         FOREACH_DIRENT_ALL(de, dir, break) {
-                _cleanup_free_ char *virtfn_link_file = NULL, *virtfn_pci_syspath = NULL;
-                const char *n;
+                _cleanup_(sd_device_unrefp) sd_device *virtfn_pcidev = NULL;
+                const char *n, *s;
 
                 n = startswith(de->d_name, "virtfn");
-                if (!n)
+                if (isempty(n))
                         continue;
 
-                virtfn_link_file = path_join(physfn_syspath, de->d_name);
-                if (!virtfn_link_file)
-                        return -ENOMEM;
-
-                if (chase_symlinks(virtfn_link_file, NULL, 0, &virtfn_pci_syspath, NULL) < 0)
+                if (sd_device_new_child(&virtfn_pcidev, physfn_pcidev, de->d_name) < 0)
                         continue;
 
-                if (streq(syspath, virtfn_pci_syspath)) {
+                if (sd_device_get_syspath(virtfn_pcidev, &s) < 0)
+                        continue;
+
+                if (streq(s, syspath)) {
                         char *suffix;
 
                         suffix = strjoin("v", n);
@@ -229,23 +226,29 @@ static int dev_pci_onboard(sd_device *dev, const LinkInfo *info, NetNames *names
 }
 
 /* read the 256 bytes PCI configuration space to check the multi-function bit */
-static bool is_pci_multifunction(sd_device *dev) {
-        _cleanup_close_ int fd = -1;
+static int is_pci_multifunction(sd_device *dev) {
+        _cleanup_free_ uint8_t *config = NULL;
         const char *filename, *syspath;
-        uint8_t config[64];
+        size_t len;
+        int r;
 
-        if (sd_device_get_syspath(dev, &syspath) < 0)
-                return false;
+        r = sd_device_get_syspath(dev, &syspath);
+        if (r < 0)
+                return r;
 
         filename = strjoina(syspath, "/config");
-        fd = open(filename, O_RDONLY | O_CLOEXEC);
-        if (fd < 0)
-                return false;
-        if (read(fd, &config, sizeof(config)) != sizeof(config))
-                return false;
+        r = read_virtual_file(filename, PCI_HEADER_TYPE + 1, (char **) &config, &len);
+        if (r < 0)
+                return r;
+        if (len < PCI_HEADER_TYPE + 1)
+                return -EINVAL;
+
+#ifndef PCI_HEADER_TYPE_MULTIFUNC
+#define PCI_HEADER_TYPE_MULTIFUNC 0x80
+#endif
 
         /* bit 0-6 header type, bit 7 multi/single function device */
-        return config[PCI_HEADER_TYPE] & 0x80;
+        return config[PCI_HEADER_TYPE] & PCI_HEADER_TYPE_MULTIFUNC;
 }
 
 static bool is_pci_ari_enabled(sd_device *dev) {
@@ -279,9 +282,9 @@ static bool is_pci_bridge(sd_device *dev) {
         return b;
 }
 
-static int parse_hotplug_slot_from_function_id(sd_device *dev, const char *slots, uint32_t *ret) {
+static int parse_hotplug_slot_from_function_id(sd_device *dev, int slots_dirfd, uint32_t *ret) {
         uint64_t function_id;
-        char path[PATH_MAX];
+        char filename[NAME_MAX+1];
         const char *attr;
         int r;
 
@@ -294,7 +297,7 @@ static int parse_hotplug_slot_from_function_id(sd_device *dev, const char *slots
          * between PCI function and its hotplug slot. */
 
         assert(dev);
-        assert(slots);
+        assert(slots_dirfd >= 0);
         assert(ret);
 
         if (!naming_scheme_has(NAMING_SLOT_FUNCTION_ID))
@@ -312,27 +315,27 @@ static int parse_hotplug_slot_from_function_id(sd_device *dev, const char *slots
                                               "Invalid function id (0x%"PRIx64"), ignoring.",
                                               function_id);
 
-        if (!snprintf_ok(path, sizeof path, "%s/%08"PRIx64, slots, function_id))
+        if (!snprintf_ok(filename, sizeof(filename), "%08"PRIx64, function_id))
                 return log_device_debug_errno(dev, SYNTHETIC_ERRNO(ENAMETOOLONG),
                                               "PCI slot path is too long, ignoring.");
 
-        if (access(path, F_OK) < 0)
-                return log_device_debug_errno(dev, errno, "Cannot access %s, ignoring: %m", path);
+        if (faccessat(slots_dirfd, filename, F_OK, 0) < 0)
+                return log_device_debug_errno(dev, errno, "Cannot access %s under pci slots, ignoring: %m", filename);
 
         *ret = (uint32_t) function_id;
         return 1;
 }
 
 static int dev_pci_slot(sd_device *dev, const LinkInfo *info, NetNames *names) {
-        const char *sysname, *attr, *syspath;
+        const char *sysname, *attr;
         _cleanup_(sd_device_unrefp) sd_device *pci = NULL;
         _cleanup_closedir_ DIR *dir = NULL;
         unsigned domain, bus, slot, func;
         sd_device *hotplug_slot_dev;
         unsigned long dev_port = 0;
         uint32_t hotplug_slot = 0;
-        char slots[PATH_MAX], *s;
         size_t l;
+        char *s;
         int r;
 
         assert(dev);
@@ -384,7 +387,7 @@ static int dev_pci_slot(sd_device *dev, const LinkInfo *info, NetNames *names) {
         if (domain > 0)
                 l = strpcpyf(&s, l, "P%u", domain);
         l = strpcpyf(&s, l, "p%us%u", bus, slot);
-        if (func > 0 || is_pci_multifunction(names->pcidev))
+        if (func > 0 || is_pci_multifunction(names->pcidev) > 0)
                 l = strpcpyf(&s, l, "f%u", func);
         if (!isempty(info->phys_port_name))
                 /* kernel provided front panel port name for multi-port PCI device */
@@ -403,21 +406,13 @@ static int dev_pci_slot(sd_device *dev, const LinkInfo *info, NetNames *names) {
         if (r < 0)
                 return log_debug_errno(r, "sd_device_new_from_subsystem_sysname() failed: %m");
 
-        r = sd_device_get_syspath(pci, &syspath);
+        r = device_opendir(pci, "slots", &dir);
         if (r < 0)
-                return log_device_debug_errno(pci, r, "sd_device_get_syspath() failed: %m");
-
-        if (!snprintf_ok(slots, sizeof slots, "%s/slots", syspath))
-                return log_device_debug_errno(dev, SYNTHETIC_ERRNO(ENAMETOOLONG),
-                                              "Cannot access %s/slots: %m", syspath);
-
-        dir = opendir(slots);
-        if (!dir)
-                return log_device_debug_errno(dev, errno, "Cannot access %s: %m", slots);
+                return log_device_debug_errno(dev, r, "Cannot access 'slots' subdirectory: %m");
 
         hotplug_slot_dev = names->pcidev;
         while (hotplug_slot_dev) {
-                r = parse_hotplug_slot_from_function_id(hotplug_slot_dev, slots, &hotplug_slot);
+                r = parse_hotplug_slot_from_function_id(hotplug_slot_dev, dirfd(dir), &hotplug_slot);
                 if (r < 0)
                         return 0;
                 if (r > 0) {
@@ -430,8 +425,8 @@ static int dev_pci_slot(sd_device *dev, const LinkInfo *info, NetNames *names) {
                         return log_device_debug_errno(hotplug_slot_dev, r, "Failed to get sysname: %m");
 
                 FOREACH_DIRENT_ALL(de, dir, break) {
-                        _cleanup_free_ char *address = NULL;
-                        char str[PATH_MAX];
+                        _cleanup_free_ char *path = NULL;
+                        const char *address;
                         uint32_t i;
 
                         if (dot_or_dot_dot(de->d_name))
@@ -441,30 +436,37 @@ static int dev_pci_slot(sd_device *dev, const LinkInfo *info, NetNames *names) {
                         if (r < 0 || i <= 0)
                                 continue;
 
+                        path = path_join("slots", de->d_name, "address");
+                        if (!path)
+                                return -ENOMEM;
+
+                        if (sd_device_get_sysattr_value(pci, path, &address) < 0)
+                                continue;
+
                         /* match slot address with device by stripping the function */
-                        if (snprintf_ok(str, sizeof str, "%s/%s/address", slots, de->d_name) &&
-                            read_one_line_file(str, &address) >= 0 &&
-                            startswith(sysname, address)) {
-                                hotplug_slot = i;
+                        if (!startswith(sysname, address))
+                                continue;
 
-                                /* We found the match between PCI device and slot. However, we won't use the
-                                 * slot index if the device is a PCI bridge, because it can have other child
-                                 * devices that will try to claim the same index and that would create name
-                                 * collision. */
-                                if (naming_scheme_has(NAMING_BRIDGE_NO_SLOT) && is_pci_bridge(hotplug_slot_dev)) {
-                                        if (naming_scheme_has(NAMING_BRIDGE_MULTIFUNCTION_SLOT) && !is_pci_multifunction(names->pcidev)) {
-                                                log_device_debug(dev, "Not using slot information because the PCI device associated with the hotplug slot is a bridge and the PCI device has single function.");
-                                                return 0;
-                                        }
+                        hotplug_slot = i;
 
-                                        if (!naming_scheme_has(NAMING_BRIDGE_MULTIFUNCTION_SLOT)) {
-                                                log_device_debug(dev, "Not using slot information because the PCI device is a bridge.");
-                                                return 0;
-                                        }
+                        /* We found the match between PCI device and slot. However, we won't use the slot
+                         * index if the device is a PCI bridge, because it can have other child devices that
+                         * will try to claim the same index and that would create name collision. */
+                        if (naming_scheme_has(NAMING_BRIDGE_NO_SLOT) && is_pci_bridge(hotplug_slot_dev)) {
+                                if (naming_scheme_has(NAMING_BRIDGE_MULTIFUNCTION_SLOT) && is_pci_multifunction(names->pcidev) <= 0) {
+                                        log_device_debug(dev,
+                                                         "Not using slot information because the PCI device associated with "
+                                                         "the hotplug slot is a bridge and the PCI device has a single function.");
+                                        return 0;
                                 }
 
-                                break;
+                                if (!naming_scheme_has(NAMING_BRIDGE_MULTIFUNCTION_SLOT)) {
+                                        log_device_debug(dev, "Not using slot information because the PCI device is a bridge.");
+                                        return 0;
+                                }
                         }
+
+                        break;
                 }
                 if (hotplug_slot > 0)
                         break;
@@ -479,7 +481,7 @@ static int dev_pci_slot(sd_device *dev, const LinkInfo *info, NetNames *names) {
                 if (domain > 0)
                         l = strpcpyf(&s, l, "P%u", domain);
                 l = strpcpyf(&s, l, "s%"PRIu32, hotplug_slot);
-                if (func > 0 || is_pci_multifunction(names->pcidev))
+                if (func > 0 || is_pci_multifunction(names->pcidev) > 0)
                         l = strpcpyf(&s, l, "f%u", func);
                 if (!isempty(info->phys_port_name))
                         l = strpcpyf(&s, l, "n%s", info->phys_port_name);
@@ -601,6 +603,94 @@ static int names_platform(sd_device *dev, NetNames *names, bool test) {
         log_device_debug(dev, "Platform identifier: vendor=%s model=%u instance=%u %s %s",
                          vendor, model, instance, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), names->platform_path);
         return 0;
+}
+
+static int dev_devicetree_onboard(sd_device *dev, NetNames *names) {
+        _cleanup_(sd_device_unrefp) sd_device *aliases_dev = NULL, *ofnode_dev = NULL, *devicetree_dev = NULL;
+        const char *alias, *ofnode_path, *ofnode_syspath, *devicetree_syspath;
+        sd_device *parent;
+        int r;
+
+        if (!naming_scheme_has(NAMING_DEVICETREE_ALIASES))
+                return 0;
+
+        /* check if our direct parent has an of_node */
+        r = sd_device_get_parent(dev, &parent);
+        if (r < 0)
+                return r;
+
+        r = sd_device_new_child(&ofnode_dev, parent, "of_node");
+        if (r < 0)
+                return r;
+
+        r = sd_device_get_syspath(ofnode_dev, &ofnode_syspath);
+        if (r < 0)
+                return r;
+
+        /* /proc/device-tree should be a symlink to /sys/firmware/devicetree/base. */
+        r = sd_device_new_from_path(&devicetree_dev, "/proc/device-tree");
+        if (r < 0)
+                return r;
+
+        r = sd_device_get_syspath(devicetree_dev, &devicetree_syspath);
+        if (r < 0)
+                return r;
+
+        /*
+         * Example paths:
+         * devicetree_syspath = /sys/firmware/devicetree/base
+         * ofnode_syspath = /sys/firmware/devicetree/base/soc/ethernet@deadbeef
+         * ofnode_path = soc/ethernet@deadbeef
+         */
+        ofnode_path = path_startswith(ofnode_syspath, devicetree_syspath);
+        if (!ofnode_path)
+                return -ENOENT;
+
+        /* Get back our leading / to match the contents of the aliases */
+        ofnode_path--;
+        assert(path_is_absolute(ofnode_path));
+
+        r = sd_device_new_child(&aliases_dev, devicetree_dev, "aliases");
+        if (r < 0)
+                return r;
+
+        FOREACH_DEVICE_SYSATTR(aliases_dev, alias) {
+                const char *alias_path, *alias_index, *conflict;
+                unsigned i;
+
+                alias_index = startswith(alias, "ethernet");
+                if (!alias_index)
+                        continue;
+
+                if (sd_device_get_sysattr_value(aliases_dev, alias, &alias_path) < 0)
+                        continue;
+
+                if (!path_equal(ofnode_path, alias_path))
+                        continue;
+
+                /* If there's no index, we default to 0... */
+                if (isempty(alias_index)) {
+                        i = 0;
+                        conflict = "ethernet0";
+                } else {
+                        r = safe_atou(alias_index, &i);
+                        if (r < 0)
+                                return log_device_debug_errno(dev, r,
+                                                "Could not get index of alias %s: %m", alias);
+                        conflict = "ethernet";
+                }
+
+                /* ...but make sure we don't have an alias conflict */
+                if (i == 0 && sd_device_get_sysattr_value(aliases_dev, conflict, NULL) >= 0)
+                        return log_device_debug_errno(dev, SYNTHETIC_ERRNO(EEXIST),
+                                        "Ethernet alias conflict: ethernet and ethernet0 both exist");
+
+                xsprintf(names->devicetree_onboard, "d%u", i);
+                names->type = NET_DEVICETREE;
+                return 0;
+        }
+
+        return -ENOENT;
 }
 
 static int names_pci(sd_device *dev, const LinkInfo *info, NetNames *names) {
@@ -850,7 +940,7 @@ static int names_mac(sd_device *dev, const LinkInfo *info) {
                 return log_device_debug_errno(dev, r, "Failed to parse addr_assign_type: %m");
         if (i != NET_ADDR_PERM)
                 return log_device_debug_errno(dev, SYNTHETIC_ERRNO(EINVAL),
-                                              "addr_assign_type=%d, MAC address is not permanent.", i);
+                                              "addr_assign_type=%u, MAC address is not permanent.", i);
         return 0;
 }
 
@@ -1037,6 +1127,15 @@ static int builtin_net_id(sd_device *dev, sd_netlink **rtnl, int argc, char *arg
                                  special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), str + strlen(prefix));
 
                 ieee_oui(dev, &info, test);
+        }
+
+        /* get devicetree aliases; only ethernet supported for now  */
+        if (streq(prefix, "en") && dev_devicetree_onboard(dev, &names) >= 0 &&
+            names.type == NET_DEVICETREE) {
+                char str[ALTIFNAMSIZ];
+
+                if (snprintf_ok(str, sizeof str, "%s%s", prefix, names.devicetree_onboard))
+                        udev_builtin_add_property(dev, test, "ID_NET_NAME_ONBOARD", str);
         }
 
         /* get path names for Linux on System z network devices */

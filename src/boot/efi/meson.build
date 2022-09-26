@@ -60,7 +60,7 @@ efi_ld = get_option('efi-ld')
 if efi_ld == 'auto'
         efi_ld = cc.get_linker_id().split('.')[1]
         if efi_ld not in ['bfd', 'gold']
-                warning('Not using @0@ as efi-ld, falling back to bfd'.format(efi_ld))
+                message('Not using @0@ as efi-ld, falling back to bfd'.format(efi_ld))
                 efi_ld = 'bfd'
         endif
 endif
@@ -199,6 +199,15 @@ efi_cflags = [
         ]
 )
 
+# Our code size has increased enough to possibly create overlapping PE sections
+# at sd-stub runtime, which will often enough prevent the image from booting.
+# This only happens because the usual instructions for assembling a unified
+# kernel image contain hardcoded addresses for section VMAs added in. Until a
+# proper solution is in place, we can at least compile with as least -O1 to
+# reduce the likelihood of this happening.
+# https://github.com/systemd/systemd/issues/24202
+efi_cflags += '-O1'
+
 efi_cflags += cc.get_supported_arguments({
         'ia32':   ['-mno-sse', '-mno-mmx'],
         'x86_64': ['-mno-red-zone', '-mno-sse', '-mno-mmx'],
@@ -260,11 +269,19 @@ efi_ldflags = [
         efi_crt0,
 ]
 
-possible_link_flags = [
-        '-Wl,--no-warn-execstack',
-        '-Wl,--no-warn-rwx-segments',
-]
-efi_ldflags += cc.get_supported_link_arguments(possible_link_flags)
+foreach arg : ['-Wl,--no-warn-execstack',
+               '-Wl,--no-warn-rwx-segments']
+        # We need to check the correct linker for supported args. This is what
+        # cc.has_multi_link_arguments() is for, but it helpfully overrides our
+        # choice of linker by putting its own -fuse-ld= arg after ours.
+        if run_command('bash', '-c',
+                       'exec "$@" -x c -o/dev/null <(echo "int main(void){return 0;}")' +
+                       ' -fuse-ld=' + efi_ld + ' -Wl,--fatal-warnings ' + arg,
+                       'bash', cc.cmd_array(),
+                       check : false).returncode() == 0
+                efi_ldflags += arg
+        endif
+endforeach
 
 if efi_arch[1] in ['aarch64', 'arm', 'riscv64']
         efi_ldflags += ['-shared']
@@ -355,6 +372,7 @@ efi_headers = files(
 
 common_sources = files(
         'assert.c',
+        'console.c',
         'devicetree.c',
         'disk.c',
         'efi-string.c',
@@ -369,7 +387,6 @@ common_sources = files(
 
 systemd_boot_sources = files(
         'boot.c',
-        'console.c',
         'drivers.c',
         'random-seed.c',
         'shim.c',
@@ -378,14 +395,13 @@ systemd_boot_sources = files(
 
 stub_sources = files(
         'cpio.c',
+        'linux.c',
         'splash.c',
         'stub.c',
 )
 
 if efi_arch[1] in ['ia32', 'x86_64']
         stub_sources += files('linux_x86.c')
-else
-        stub_sources += files('linux.c')
 endif
 
 tests += [

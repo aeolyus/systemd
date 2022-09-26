@@ -134,6 +134,7 @@ static usec_t arg_default_restart_usec;
 static usec_t arg_default_timeout_start_usec;
 static usec_t arg_default_timeout_stop_usec;
 static usec_t arg_default_timeout_abort_usec;
+static usec_t arg_default_device_timeout_usec;
 static bool arg_default_timeout_abort_set;
 static usec_t arg_default_start_limit_interval;
 static unsigned arg_default_start_limit_burst;
@@ -627,6 +628,7 @@ static int parse_config_file(void) {
                 { "Manager", "DefaultTimeoutStartSec",       config_parse_sec,                   0,                        &arg_default_timeout_start_usec   },
                 { "Manager", "DefaultTimeoutStopSec",        config_parse_sec,                   0,                        &arg_default_timeout_stop_usec    },
                 { "Manager", "DefaultTimeoutAbortSec",       config_parse_default_timeout_abort, 0,                        NULL                              },
+                { "Manager", "DefaultDeviceTimeoutSec",      config_parse_sec,                   0,                        &arg_default_device_timeout_usec  },
                 { "Manager", "DefaultRestartSec",            config_parse_sec,                   0,                        &arg_default_restart_usec         },
                 { "Manager", "DefaultStartLimitInterval",    config_parse_sec,                   0,                        &arg_default_start_limit_interval }, /* obsolete alias */
                 { "Manager", "DefaultStartLimitIntervalSec", config_parse_sec,                   0,                        &arg_default_start_limit_interval },
@@ -689,6 +691,7 @@ static int parse_config_file(void) {
                         config_item_table_lookup, items,
                         CONFIG_PARSE_WARN,
                         NULL,
+                        NULL,
                         NULL);
 
         /* Traditionally "0" was used to turn off the default unit timeouts. Fix this up so that we use
@@ -716,6 +719,7 @@ static void set_manager_defaults(Manager *m) {
         m->default_timeout_stop_usec = arg_default_timeout_stop_usec;
         m->default_timeout_abort_usec = arg_default_timeout_abort_usec;
         m->default_timeout_abort_set = arg_default_timeout_abort_set;
+        m->default_device_timeout_usec = arg_default_device_timeout_usec;
         m->default_restart_usec = arg_default_restart_usec;
         m->default_start_limit_interval = arg_default_start_limit_interval;
         m->default_start_limit_burst = arg_default_start_limit_burst;
@@ -1656,7 +1660,7 @@ static void initialize_coredump(bool skip_setup) {
 
         /* But at the same time, turn off the core_pattern logic by default, so that no coredumps are stored
          * until the systemd-coredump tool is enabled via sysctl. However it can be changed via the kernel
-         * command line later so core dumps can still be generated during early startup and in initramfs. */
+         * command line later so core dumps can still be generated during early startup and in initrd. */
         if (!skip_setup)
                 disable_coredumps();
 #endif
@@ -1854,7 +1858,7 @@ static int do_reexecute(
                 args[i++] = argv[j];
         assert(i <= args_size);
 
-        /* Re-enable any blocked signals, especially important if we switch from initial ramdisk to init=... */
+        /* Re-enable any blocked signals, especially important if we switch from initrd to init=... */
         (void) reset_all_signal_handlers();
         (void) reset_signal_mask();
         (void) rlimit_nofile_safe();
@@ -1966,6 +1970,8 @@ static int invoke_main_loop(
                         return objective;
 
                 case MANAGER_SWITCH_ROOT:
+                        manager_set_switching_root(m, true);
+
                         if (!m->switch_root_init) {
                                 r = prepare_reexecute(m, &arg_serialization, ret_fds, true);
                                 if (r < 0) {
@@ -2046,7 +2052,7 @@ static void log_execution_mode(bool *ret_first_boot) {
 
                 if (in_initrd()) {
                         *ret_first_boot = false;
-                        log_info("Running in initial RAM disk.");
+                        log_info("Running in initrd.");
                 } else {
                         int r;
                         _cleanup_free_ char *id_text = NULL;
@@ -2387,6 +2393,7 @@ static void reset_arguments(void) {
         arg_default_timeout_stop_usec = DEFAULT_TIMEOUT_USEC;
         arg_default_timeout_abort_usec = DEFAULT_TIMEOUT_USEC;
         arg_default_timeout_abort_set = false;
+        arg_default_device_timeout_usec = DEFAULT_TIMEOUT_USEC;
         arg_default_start_limit_interval = DEFAULT_START_LIMIT_INTERVAL;
         arg_default_start_limit_burst = DEFAULT_START_LIMIT_BURST;
         arg_runtime_watchdog = 0;
@@ -2819,6 +2826,7 @@ int main(int argc, char *argv[]) {
         } else {
                 /* Running as user instance */
                 arg_system = false;
+                log_set_always_reopen_console(true);
                 log_set_target(LOG_TARGET_AUTO);
                 log_open();
 
@@ -2942,6 +2950,7 @@ int main(int argc, char *argv[]) {
         set_manager_defaults(m);
         set_manager_settings(m);
         manager_set_first_boot(m, first_boot);
+        manager_set_switching_root(m, arg_switched_root);
 
         /* Remember whether we should queue the default job */
         queue_default_job = !arg_serialization || arg_switched_root;

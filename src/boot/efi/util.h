@@ -60,13 +60,41 @@ static inline void *xmalloc_multiply(size_t size, size_t n) {
 _malloc_ _alloc_(3) _returns_nonnull_ _warn_unused_result_
 static inline void *xrealloc(void *p, size_t old_size, size_t new_size) {
         void *r = xmalloc(new_size);
-        efi_memcpy(r, p, MIN(old_size, new_size));
+        new_size = MIN(old_size, new_size);
+        if (new_size > 0)
+                memcpy(r, p, new_size);
         free(p);
         return r;
 }
 
 #define xpool_print(fmt, ...) ((char16_t *) ASSERT_SE_PTR(PoolPrint((fmt), ##__VA_ARGS__)))
 #define xnew(type, n) ((type *) xmalloc_multiply(sizeof(type), (n)))
+
+typedef struct {
+        EFI_PHYSICAL_ADDRESS addr;
+        size_t n_pages;
+} Pages;
+
+static inline void cleanup_pages(Pages *p) {
+        if (p->n_pages == 0)
+                return;
+#ifdef EFI_DEBUG
+        assert_se(BS->FreePages(p->addr, p->n_pages) == EFI_SUCCESS);
+#else
+        (void) BS->FreePages(p->addr, p->n_pages);
+#endif
+}
+
+#define _cleanup_pages_ _cleanup_(cleanup_pages)
+
+static inline Pages xmalloc_pages(
+                EFI_ALLOCATE_TYPE type, EFI_MEMORY_TYPE memory_type, size_t n_pages, EFI_PHYSICAL_ADDRESS addr) {
+        assert_se(BS->AllocatePages(type, memory_type, n_pages, &addr) == EFI_SUCCESS);
+        return (Pages) {
+                .addr = addr,
+                .n_pages = n_pages,
+        };
+}
 
 EFI_STATUS parse_boolean(const char *v, bool *b);
 
@@ -167,6 +195,10 @@ extern uint8_t _text, _data;
 #  define debug_hook(identity)
 #endif
 
+#ifdef EFI_DEBUG
+void hexdump(const char16_t *prefix, const void *data, UINTN size);
+#endif
+
 #if defined(__i386__) || defined(__x86_64__)
 void beep(UINTN beep_count);
 #else
@@ -175,3 +207,11 @@ static inline void beep(UINTN beep_count) {}
 
 EFI_STATUS open_volume(EFI_HANDLE device, EFI_FILE **ret_file);
 EFI_STATUS make_file_device_path(EFI_HANDLE device, const char16_t *file, EFI_DEVICE_PATH **ret_dp);
+
+#if defined(__i386__) || defined(__x86_64__)
+bool in_hypervisor(void);
+#else
+static inline bool in_hypervisor(void) {
+        return false;
+}
+#endif

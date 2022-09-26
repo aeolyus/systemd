@@ -1627,9 +1627,9 @@ static int parse_argv(int argc, char *argv[]) {
                         if (r == -ENOMEM)
                                 return log_oom();
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse --set-credential= parameter: %m");
+                                return log_error_errno(r, "Failed to parse --load-credential= parameter: %m");
                         if (r == 0 || !p)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Missing value for --set-credential=: %s", optarg);
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Missing value for --load-credential=: %s", optarg);
 
                         if (!credential_name_valid(word))
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Credential name is not valid: %s", word);
@@ -2544,11 +2544,10 @@ struct ExposeArgs {
 };
 
 static int on_address_change(sd_netlink *rtnl, sd_netlink_message *m, void *userdata) {
-        struct ExposeArgs *args = userdata;
+        struct ExposeArgs *args = ASSERT_PTR(userdata);
 
         assert(rtnl);
         assert(m);
-        assert(args);
 
         (void) expose_port_execute(rtnl, &args->fw_ctx, arg_expose_ports, AF_INET, &args->address4);
         (void) expose_port_execute(rtnl, &args->fw_ctx, arg_expose_ports, AF_INET6, &args->address6);
@@ -3806,7 +3805,7 @@ static int outer_child(
             IN_SET(arg_userns_ownership, USER_NAMESPACE_OWNERSHIP_MAP, USER_NAMESPACE_OWNERSHIP_AUTO) &&
             arg_uid_shift != 0) {
 
-                r = remount_idmap(directory, arg_uid_shift, arg_uid_range, REMOUNT_IDMAP_HOST_ROOT);
+                r = remount_idmap(directory, arg_uid_shift, arg_uid_range, UID_INVALID, REMOUNT_IDMAPPING_HOST_ROOT);
                 if (r == -EINVAL || ERRNO_IS_NOT_SUPPORTED(r)) {
                         /* This might fail because the kernel or file system doesn't support idmapping. We
                          * can't really distinguish this nicely, nor do we have any guarantees about the
@@ -4934,7 +4933,7 @@ static int run_container(
                 if (l < 0)
                         return log_error_errno(errno, "Failed to read cgroup mode: %m");
                 if (l != sizeof(arg_unified_cgroup_hierarchy))
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Short read while reading cgroup mode (%zu bytes).%s",
+                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Short read while reading cgroup mode (%zi bytes).%s",
                                                l, l == 0 ? " The child is most likely dead." : "");
         }
 
@@ -5444,7 +5443,6 @@ static int run(int argc, char *argv[]) {
         _cleanup_(release_lock_file) LockFile tree_global_lock = LOCK_FILE_INIT, tree_local_lock = LOCK_FILE_INIT;
         char tmprootdir[] = "/tmp/nspawn-root-XXXXXX";
         _cleanup_(loop_device_unrefp) LoopDevice *loop = NULL;
-        _cleanup_(decrypted_image_unrefp) DecryptedImage *decrypted_image = NULL;
         _cleanup_(dissected_image_unrefp) DissectedImage *dissected_image = NULL;
         _cleanup_(fw_ctx_freep) FirewallContext *fw_ctx = NULL;
         pid_t pid = 0;
@@ -5746,27 +5744,17 @@ static int run(int argc, char *argv[]) {
                                 arg_image,
                                 arg_read_only ? O_RDONLY : O_RDWR,
                                 FLAGS_SET(dissect_image_flags, DISSECT_IMAGE_NO_PARTITION_TABLE) ? 0 : LO_FLAGS_PARTSCAN,
+                                LOCK_SH,
                                 &loop);
                 if (r < 0) {
                         log_error_errno(r, "Failed to set up loopback block device: %m");
                         goto finish;
                 }
 
-                /* Take a LOCK_SH lock on the device, so that udevd doesn't issue BLKRRPART in our back */
-                r = loop_device_flock(loop, LOCK_SH);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to take lock on loopback block device: %m");
-                        goto finish;
-                }
-
-                r = dissect_image_and_warn(
-                                loop->fd,
-                                arg_image,
+                r = dissect_loop_device_and_warn(
+                                loop,
                                 &arg_verity_settings,
                                 NULL,
-                                loop->diskseq,
-                                loop->uevent_seqnum_not_before,
-                                loop->timestamp_not_before,
                                 dissect_image_flags,
                                 &dissected_image);
                 if (r == -ENOPKG) {
@@ -5797,8 +5785,7 @@ static int run(int argc, char *argv[]) {
                                 dissected_image,
                                 NULL,
                                 &arg_verity_settings,
-                                0,
-                                &decrypted_image);
+                                0);
                 if (r < 0)
                         goto finish;
 

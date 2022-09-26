@@ -12,6 +12,7 @@
 
 #include "alloc-util.h"
 #include "bus-error.h"
+#include "bus-locator.h"
 #include "bus-util.h"
 #include "compress.h"
 #include "def.h"
@@ -716,7 +717,7 @@ static int print_info(FILE *file, sd_journal *j, bool need_space) {
                         ansi_normal());
 
                 if (size != UINT64_MAX)
-                        fprintf(file, "     Disk Size: %s\n", FORMAT_BYTES(size));
+                        fprintf(file, "  Size on Disk: %s\n", FORMAT_BYTES(size));
 
         } else if (coredump)
                 fprintf(file, "       Storage: journal\n");
@@ -821,7 +822,7 @@ static int dump_list(int argc, char **argv, void *userdata) {
                 (void) table_set_align_percent(t, TABLE_HEADER_CELL(3), 100);
                 (void) table_set_align_percent(t, TABLE_HEADER_CELL(7), 100);
 
-                (void) table_set_empty_string(t, "-");
+                table_set_ersatz_string(t, TABLE_ERSATZ_DASH);
         } else
                 pager_open(arg_pager_flags);
 
@@ -1196,13 +1197,7 @@ static int check_units_active(void) {
         if (r < 0)
                 return log_error_errno(r, "Failed to acquire bus: %m");
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &m,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "ListUnitsByPatterns");
+        r = bus_message_new_method_call(bus, &m, bus_systemd_mgr, "ListUnitsByPatterns");
         if (r < 0)
                 return bus_log_create_error(r);
 

@@ -49,17 +49,16 @@ static void* thread_func(void *ptr) {
 
                 assert_se(mkdtemp_malloc(NULL, &mounted) >= 0);
 
-                r = loop_device_make(fd, O_RDONLY, 0, UINT64_MAX, LO_FLAGS_PARTSCAN, &loop);
+                r = loop_device_make(fd, O_RDONLY, 0, UINT64_MAX, LO_FLAGS_PARTSCAN, LOCK_SH, &loop);
                 if (r < 0)
                         log_error_errno(r, "Failed to allocate loopback device: %m");
                 assert_se(r >= 0);
+                assert_se(loop->dev);
+                assert_se(loop->backing_file);
 
                 log_notice("Acquired loop device %s, will mount on %s", loop->node, mounted);
 
-                /* Let's make sure udev doesn't call BLKRRPART in the background, while we try to mount the device. */
-                assert_se(loop_device_flock(loop, LOCK_SH) >= 0);
-
-                r = dissect_image(loop->fd, NULL, NULL, loop->diskseq, loop->uevent_seqnum_not_before, loop->timestamp_not_before, DISSECT_IMAGE_READ_ONLY, &dissected);
+                r = dissect_loop_device(loop, NULL, NULL, DISSECT_IMAGE_READ_ONLY, &dissected);
                 if (r < 0)
                         log_error_errno(r, "Failed dissect loopback device %s: %m", loop->node);
                 assert_se(r >= 0);
@@ -112,7 +111,7 @@ static void* thread_func(void *ptr) {
 #endif
 
 static bool have_root_gpt_type(void) {
-#ifdef GPT_ROOT_NATIVE
+#ifdef SD_GPT_ROOT_NATIVE
         return true;
 #else
         return false;
@@ -203,10 +202,10 @@ static int run(int argc, char *argv[]) {
               "size=32M, type=0657FD6D-A4AB-43C4-84E5-0933C84B4F4F\n"
               "size=32M, type=", sfdisk);
 
-#ifdef GPT_ROOT_NATIVE
-        fprintf(sfdisk, SD_ID128_UUID_FORMAT_STR, SD_ID128_FORMAT_VAL(GPT_ROOT_NATIVE));
+#ifdef SD_GPT_ROOT_NATIVE
+        fprintf(sfdisk, SD_ID128_UUID_FORMAT_STR, SD_ID128_FORMAT_VAL(SD_GPT_ROOT_NATIVE));
 #else
-        fprintf(sfdisk, SD_ID128_UUID_FORMAT_STR, SD_ID128_FORMAT_VAL(GPT_ROOT_X86_64));
+        fprintf(sfdisk, SD_ID128_UUID_FORMAT_STR, SD_ID128_FORMAT_VAL(SD_GPT_ROOT_X86_64));
 #endif
 
         fputs("\n"
@@ -215,7 +214,7 @@ static int run(int argc, char *argv[]) {
         assert_se(pclose(sfdisk) == 0);
         sfdisk = NULL;
 
-        assert_se(loop_device_make(fd, O_RDWR, 0, UINT64_MAX, LO_FLAGS_PARTSCAN, &loop) >= 0);
+        assert_se(loop_device_make(fd, O_RDWR, 0, UINT64_MAX, LO_FLAGS_PARTSCAN, LOCK_EX, &loop) >= 0);
 
 #if HAVE_BLKID
         _cleanup_(dissected_image_unrefp) DissectedImage *dissected = NULL;
@@ -223,12 +222,7 @@ static int run(int argc, char *argv[]) {
         pthread_t threads[arg_n_threads];
         sd_id128_t id;
 
-        /* Take an explicit lock while we format the file systems, in accordance with
-         * https://systemd.io/BLOCK_DEVICE_LOCKING/. We don't want udev to interfere and probe while we write
-         * or even issue BLKRRPART or similar while we are working on this. */
-        assert_se(loop_device_flock(loop, LOCK_EX) >= 0);
-
-        assert_se(dissect_image(loop->fd, NULL, NULL, loop->diskseq, loop->uevent_seqnum_not_before, loop->timestamp_not_before, 0, &dissected) >= 0);
+        assert_se(dissect_loop_device(loop, NULL, NULL, 0, &dissected) >= 0);
 
         assert_se(dissected->partitions[PARTITION_ESP].found);
         assert_se(dissected->partitions[PARTITION_ESP].node);
@@ -240,19 +234,19 @@ static int run(int argc, char *argv[]) {
         assert_se(dissected->partitions[PARTITION_HOME].node);
 
         assert_se(sd_id128_randomize(&id) >= 0);
-        assert_se(make_filesystem(dissected->partitions[PARTITION_ESP].node, "vfat", "EFI", id, true) >= 0);
+        assert_se(make_filesystem(dissected->partitions[PARTITION_ESP].node, "vfat", "EFI", NULL, id, true) >= 0);
 
         assert_se(sd_id128_randomize(&id) >= 0);
-        assert_se(make_filesystem(dissected->partitions[PARTITION_XBOOTLDR].node, "vfat", "xbootldr", id, true) >= 0);
+        assert_se(make_filesystem(dissected->partitions[PARTITION_XBOOTLDR].node, "vfat", "xbootldr", NULL, id, true) >= 0);
 
         assert_se(sd_id128_randomize(&id) >= 0);
-        assert_se(make_filesystem(dissected->partitions[PARTITION_ROOT].node, "ext4", "root", id, true) >= 0);
+        assert_se(make_filesystem(dissected->partitions[PARTITION_ROOT].node, "ext4", "root", NULL, id, true) >= 0);
 
         assert_se(sd_id128_randomize(&id) >= 0);
-        assert_se(make_filesystem(dissected->partitions[PARTITION_HOME].node, "ext4", "home", id, true) >= 0);
+        assert_se(make_filesystem(dissected->partitions[PARTITION_HOME].node, "ext4", "home", NULL, id, true) >= 0);
 
         dissected = dissected_image_unref(dissected);
-        assert_se(dissect_image(loop->fd, NULL, NULL, loop->diskseq, loop->uevent_seqnum_not_before, loop->timestamp_not_before, 0, &dissected) >= 0);
+        assert_se(dissect_loop_device(loop, NULL, NULL, 0, &dissected) >= 0);
 
         assert_se(mkdtemp_malloc(NULL, &mounted) >= 0);
 
